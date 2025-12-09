@@ -56,23 +56,27 @@ fn parse_u64_from_value(value: &Value) -> Option<u64> {
     }
 }
 
-async fn fetch_friend_ids(app_client: &RESTClient) -> Result<HashSet<u64>, String> {
-    let response = app_client
-        .get("/lol-chat/v1/friends".to_string())
-        .await
-        .map_err(|err| format!("{err:?}"))?;
+async fn fetch_friend_ids(app_client: &RESTClient) -> HashSet<String> {
+    let response = match app_client.get("/lol-chat/v1/friends".to_string()).await {
+        Ok(res) => res,
+        Err(_) => return HashSet::new(), // fail-safe
+    };
 
     let mut ids = HashSet::new();
 
     if let Some(arr) = response.as_array() {
-        for f in arr {
-            if let Some(id) = f.get("summonerId").and_then(parse_u64_from_value) {
-                ids.insert(id);
+        for friend in arr {
+            if let Some(id_val) = friend.get("summonerId") {
+                if let Some(id_str) = id_val.as_str() {
+                    ids.insert(id_str.trim().trim_matches('"').to_string());
+                } else if let Some(id_num) = id_val.as_u64() {
+                    ids.insert(id_num.to_string());
+                }
             }
         }
     }
 
-    Ok(ids)
+    ids
 }
 
 pub async fn handle_end_game_start_(
@@ -102,31 +106,37 @@ pub async fn handle_end_game_start_(
         guard.last_report = Some(game_id);
     }
 
-    let friend_ids = fetch_friend_ids(&app_client).await.unwrap_or_default();
-
+    let friend_ids = fetch_friend_ids(&app_client).await;
     let local_player = response.get("localPlayer").and_then(|p| {
         let id = p.get("summonerId").and_then(parse_u64_from_value)?;
         let puuid = p.get("puuid")?.as_str()?.to_string();
         Some((id, puuid))
     });
 
+    
     if let Some((local_summoner_id, _)) = local_player {
         if let Some(teams) = response.get("teams").and_then(|v| v.as_array()) {
             for team in teams {
                 if let Some(players) = team.get("players").and_then(|v| v.as_array()) {
                     for player in players {
+                        // parse player summoner ID
                         let Some(player_id) =
                             player.get("summonerId").and_then(parse_u64_from_value)
                         else { continue };
 
+                        let player_id_str = player_id.to_string();
+
                         // skip self + friends
-                        if player_id == local_summoner_id || friend_ids.contains(&player_id) {
+                        if player_id == local_summoner_id
+                            || friend_ids.contains(&player_id_str)
+                        {
                             continue;
                         }
 
                         let Some(player_puuid) = player.get("puuid").and_then(|v| v.as_str())
                         else { continue };
 
+                        // send report
                         let report_payload = serde_json::json!({
                             "gameId": game_id,
                             "categories": REPORT_CATEGORIES,
@@ -141,13 +151,13 @@ pub async fn handle_end_game_start_(
                             )
                             .await;
 
+                        // notify frontend
                         let frontend_payload = serde_json::json!({
                             "summonerId": player_id,
                             "puuid": player_puuid,
                             "gameId": game_id
                         });
 
-                        // <-- FIXED LINE
                         let _ = app_handle.emit_all("end_of_game_started", frontend_payload);
                     }
                 }
